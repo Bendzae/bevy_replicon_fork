@@ -25,7 +25,7 @@ use bevy_replicon::replicon_core::replication_rules::{
     DeserializeFn, RemoveComponentFn, SerializeFn,
 };
 
-const MAX_TICK_RATE: u16 = 60;
+const MAX_TICK_RATE: u16 = 30;
 
 fn main() {
     App::new()
@@ -196,22 +196,6 @@ fn movement_system(
         }
     }
 }
-
-// fn snapshot_buffer_system(
-//     mut q_player: Query<
-//         (&PlayerPosition, &mut PlayerPositionSnapshotBuffer),
-//         Changed<PlayerPosition>,
-//     >,
-//     mut server_tick_timer: ResMut<ServerTickTimer>,
-// ) {
-//     for (server_pos, mut snapshot_buffer) in q_player.iter_mut() {
-//         snapshot_buffer.0.push_back(server_pos.0);
-//         if snapshot_buffer.0.len() > 2 {
-//             snapshot_buffer.0.pop_front();
-//         }
-//         server_tick_timer.0.reset();
-//     }
-// }
 
 // Spawns a new player whenever a client connects
 fn server_event_system(mut commands: Commands, mut server_event: EventReader<ServerEvent>) {
