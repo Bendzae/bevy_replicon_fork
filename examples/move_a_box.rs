@@ -1,12 +1,17 @@
 use std::collections::VecDeque;
 use std::error::Error;
+use std::fmt::Debug;
+use std::io::Cursor;
 use std::net::Ipv4Addr;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
+use bevy::ecs::world::EntityMut;
 use bevy::prelude::*;
+use bevy::ptr::Ptr;
 use bevy_inspector_egui::quick::WorldInspectorPlugin;
 use clap::Parser;
+use log::info;
 use serde::{Deserialize, Serialize};
 
 use bevy_replicon::prelude::*;
@@ -14,8 +19,11 @@ use bevy_replicon::renet::transport::{
     ClientAuthentication, NetcodeClientTransport, NetcodeServerTransport, ServerAuthentication,
     ServerConfig,
 };
-use bevy_replicon::renet::{ConnectionConfig, ServerEvent};
-use log::info;
+use bevy_replicon::renet::{Bytes, ConnectionConfig, ServerEvent};
+use bevy_replicon::replicon_core::replication_rules;
+use bevy_replicon::replicon_core::replication_rules::{
+    DeserializeFn, RemoveComponentFn, SerializeFn,
+};
 
 const MAX_TICK_RATE: u16 = 60;
 
@@ -36,7 +44,14 @@ fn main() {
                 .build()
                 .set(ServerPlugin::new(TickPolicy::MaxTickRate(MAX_TICK_RATE)))),
         )
-        .replicate::<PlayerServerPosition>()
+        .add_plugins(SnapshotInterpolationPlugin {
+            max_tick_rate: MAX_TICK_RATE,
+        })
+        .replicate_with_interpolation::<PlayerPosition>(
+            serialize_player_position,
+            deserialize_player_position,
+            replication_rules::remove_component::<PlayerPosition>,
+        )
         .replicate::<PlayerColor>()
         .add_client_event::<MoveCommandEvent>(SendPolicy::Ordered)
         .add_systems(
@@ -54,27 +69,42 @@ fn main() {
         .add_systems(Update, (input_system).run_if(is_client_or_single_player()))
         // Systems that run everywhere
         .add_systems(Update, draw_box_system)
-        // Snapshot Interpolation
-        .add_systems(
-            Update,
-            (
-                player_init_system,
-                snapshot_buffer_system,
-                interpolation_system,
-            )
-                .run_if(resource_exists::<RenetClient>()),
-        )
         .run();
 }
 
-#[derive(Component, Deserialize, Serialize)]
-struct PlayerServerPosition(Vec2);
+#[derive(Component, Deserialize, Serialize, Clone, Debug)]
+struct PlayerPosition(Vec2);
 
-#[derive(Component)]
-struct PlayerPositionSnapshotBuffer(VecDeque<Vec2>);
+impl Interpolate for PlayerPosition {
+    fn interpolate(&self, other: Self, t: f32) -> Self {
+        Self(self.0.lerp(other.0, t))
+    }
+}
 
-#[derive(Component)]
-struct PlayerClientPosition(Vec2);
+pub fn deserialize_player_position(
+    entity: &mut EntityMut,
+    _entity_map: &mut ServerEntityMap,
+    mut cursor: &mut Cursor<Bytes>,
+    tick: RepliconTick,
+) -> Result<(), bincode::Error> {
+    let value: Vec2 = bincode::deserialize_from(&mut cursor)?;
+    let component = PlayerPosition(value);
+    if let Some(mut buffer) = entity.get_mut::<SnapshotBuffer<PlayerPosition>>() {
+        buffer.insert(component);
+    } else {
+        entity.insert(component);
+    }
+    Ok(())
+}
+
+pub fn serialize_player_position(
+    component: Ptr,
+    mut cursor: &mut Cursor<Vec<u8>>,
+) -> Result<(), bincode::Error> {
+    // SAFETY: Function called for registered `ComponentId`.
+    let component: &PlayerPosition = unsafe { component.deref() };
+    bincode::serialize_into(cursor, &component)
+}
 
 #[derive(Component, Deserialize, Serialize)]
 struct PlayerColor(Color);
@@ -86,48 +116,29 @@ struct Player(u64);
 #[derive(Bundle)]
 struct PlayerBundle {
     player: Player,
-    server_position: PlayerServerPosition,
-    client_position: PlayerClientPosition,
+    server_position: PlayerPosition,
     color: PlayerColor,
     replication: Replication,
+    interpolated: Interpolated,
 }
 
 impl PlayerBundle {
     fn new(id: u64, position: Vec2, color: Color) -> Self {
         Self {
             player: Player(id),
-            server_position: PlayerServerPosition(position),
-            client_position: PlayerClientPosition(position),
+            server_position: PlayerPosition(position),
             color: PlayerColor(color),
             replication: Replication,
+            interpolated: Interpolated,
         }
     }
 }
 
-fn player_init_system(
-    mut commands: Commands,
-    spawned_players: Query<(Entity, &PlayerServerPosition), Added<PlayerServerPosition>>,
-) {
-    for (entity, server_pos) in &spawned_players {
-        commands.entity(entity).insert((
-            PlayerClientPosition(server_pos.0),
-            PlayerPositionSnapshotBuffer(vec![server_pos.0].into()),
-        ));
-    }
-}
-
-#[derive(Resource)]
-struct ServerTickTimer(Timer);
-
 fn init_system(mut commands: Commands) {
     commands.spawn(Camera2dBundle::default());
-    commands.insert_resource(ServerTickTimer(Timer::new(
-        Duration::from_secs_f32(1.0 / MAX_TICK_RATE as f32),
-        TimerMode::Once,
-    )))
 }
 
-fn draw_box_system(q_net_pos: Query<(&PlayerClientPosition, &PlayerColor)>, mut gizmos: Gizmos) {
+fn draw_box_system(q_net_pos: Query<(&PlayerPosition, &PlayerColor)>, mut gizmos: Gizmos) {
     for (p, color) in q_net_pos.iter() {
         gizmos.rect(
             Vec3::new(p.0.x, p.0.y, 0.),
@@ -172,64 +183,35 @@ fn input_system(input: Res<Input<KeyCode>>, mut move_event: EventWriter<MoveComm
 // Mutate PlayerPosition based on MoveCommandEvents, runs on server or single player instance
 fn movement_system(
     mut events: EventReader<FromClient<MoveCommandEvent>>,
-    mut q_net_pos: Query<(
-        &Player,
-        &mut PlayerServerPosition,
-        &mut PlayerClientPosition,
-    )>,
+    mut q_net_pos: Query<(&Player, &mut PlayerPosition)>,
     time: Res<Time>,
 ) {
     let move_speed = 300.0;
     for FromClient { client_id, event } in &mut events {
         // info!("received event {event:?} from client {client_id}");
-        for (player, mut position, mut client_position) in q_net_pos.iter_mut() {
+        for (player, mut position) in q_net_pos.iter_mut() {
             if *client_id == player.0 {
                 position.0 += event.direction * time.delta_seconds() * move_speed;
-                client_position.0 = position.0;
             }
         }
     }
 }
 
-fn snapshot_buffer_system(
-    mut q_player: Query<
-        (&PlayerServerPosition, &mut PlayerPositionSnapshotBuffer),
-        Changed<PlayerServerPosition>,
-    >,
-    mut server_tick_timer: ResMut<ServerTickTimer>,
-) {
-    for (server_pos, mut snapshot_buffer) in q_player.iter_mut() {
-        snapshot_buffer.0.push_back(server_pos.0);
-        if snapshot_buffer.0.len() > 2 {
-            snapshot_buffer.0.pop_front();
-        }
-        server_tick_timer.0.reset();
-    }
-}
-
-fn interpolation_system(
-    mut q_player: Query<(&PlayerPositionSnapshotBuffer, &mut PlayerClientPosition)>,
-    mut server_tick_timer: ResMut<ServerTickTimer>,
-    time: Res<Time>,
-) {
-    for (snapshot_buffer, mut client_pos) in q_player.iter_mut() {
-        if snapshot_buffer.0.len() < 2 {
-            continue;
-        }
-
-        let tick_duration = 1.0 / (MAX_TICK_RATE as f32);
-
-        let t = if server_tick_timer.0.finished() {
-            1.0
-        } else {
-            server_tick_timer.0.elapsed_secs() / tick_duration
-        };
-        client_pos.0 = snapshot_buffer.0[0].lerp(snapshot_buffer.0[1], t);
-    }
-    server_tick_timer
-        .0
-        .tick(Duration::from_secs_f32(time.delta_seconds()));
-}
+// fn snapshot_buffer_system(
+//     mut q_player: Query<
+//         (&PlayerPosition, &mut PlayerPositionSnapshotBuffer),
+//         Changed<PlayerPosition>,
+//     >,
+//     mut server_tick_timer: ResMut<ServerTickTimer>,
+// ) {
+//     for (server_pos, mut snapshot_buffer) in q_player.iter_mut() {
+//         snapshot_buffer.0.push_back(server_pos.0);
+//         if snapshot_buffer.0.len() > 2 {
+//             snapshot_buffer.0.pop_front();
+//         }
+//         server_tick_timer.0.reset();
+//     }
+// }
 
 // Spawns a new player whenever a client connects
 fn server_event_system(mut commands: Commands, mut server_event: EventReader<ServerEvent>) {
@@ -367,6 +349,23 @@ fn is_client_or_single_player(
 
 // Interpolation
 
+struct SnapshotInterpolationPlugin {
+    max_tick_rate: u16,
+}
+impl Plugin for SnapshotInterpolationPlugin {
+    fn build(&self, app: &mut App) {
+        app.replicate::<Interpolated>()
+            .insert_resource(InterpolationConfig {
+                max_tick_rate: self.max_tick_rate,
+            });
+    }
+}
+
+#[derive(Resource)]
+struct InterpolationConfig {
+    max_tick_rate: u16,
+}
+
 #[derive(Component, Deserialize, Serialize)]
 struct Interpolated;
 
@@ -375,5 +374,97 @@ trait Interpolate {
 }
 
 #[derive(Component, Deserialize, Serialize)]
-struct SnapshotBuffer<T>(VecDeque<T>);
-fn test<T: Component + Interpolate>(q: Query<(Entity, &mut T)>) {}
+struct SnapshotBuffer<T: Component + Interpolate + Clone> {
+    buffer: VecDeque<T>,
+    time_since_last_snapshot: f32,
+}
+impl<T: Component + Interpolate + Clone> SnapshotBuffer<T> {
+    pub fn new() -> Self {
+        Self {
+            buffer: VecDeque::new(),
+            time_since_last_snapshot: 0.0,
+        }
+    }
+    pub fn insert(&mut self, element: T) {
+        if self.buffer.len() > 1 {
+            self.buffer.pop_front();
+        }
+        self.buffer.push_back(element);
+        self.time_since_last_snapshot = 0.0;
+    }
+}
+
+fn snapshot_buffer_init_system<T: Component + Interpolate + Clone>(
+    q_interpolated: Query<(Entity, &T), Added<Interpolated>>,
+    mut commands: Commands,
+) {
+    for (e, initial_value) in q_interpolated.iter() {
+        let mut buffer = SnapshotBuffer::new();
+        buffer.insert(initial_value.clone());
+        commands.entity(e).insert(buffer);
+        info!("intialized buffer");
+    }
+}
+fn snapshot_interpolation_system<T: Component + Interpolate + Clone + Debug>(
+    mut q: Query<(Entity, &mut T, &mut SnapshotBuffer<T>), With<Interpolated>>,
+    time: Res<Time>,
+    config: Res<InterpolationConfig>,
+) {
+    for (e, mut component, mut snapshot_buffer) in q.iter_mut() {
+        let buffer = &snapshot_buffer.buffer;
+        let elapsed = snapshot_buffer.time_since_last_snapshot;
+        if buffer.len() < 2 {
+            continue;
+        }
+
+        let tick_duration = 1.0 / (config.max_tick_rate as f32);
+
+        if elapsed > tick_duration + time.delta_seconds() {
+            continue;
+        }
+
+        let t = (elapsed / tick_duration).clamp(0., 1.);
+        info!(
+            "Snapshot 0: {:?} ,Snapshot 1: {:?}, t: {:?}",
+            buffer[0].clone(),
+            buffer[1].clone(),
+            t
+        );
+        *component = buffer[0].interpolate(buffer[1].clone(), t);
+        snapshot_buffer.time_since_last_snapshot += time.delta_seconds();
+    }
+}
+
+trait AppInterpolationExt {
+    /// TODO: Add docs
+    fn replicate_with_interpolation<C>(
+        &mut self,
+        serialize: SerializeFn,
+        deserialize: DeserializeFn,
+        remove: RemoveComponentFn,
+    ) -> &mut Self
+    where
+        C: Component + Interpolate + Clone + Debug;
+}
+impl AppInterpolationExt for App {
+    fn replicate_with_interpolation<T>(
+        &mut self,
+        serialize: SerializeFn,
+        deserialize: DeserializeFn,
+        remove: RemoveComponentFn,
+    ) -> &mut Self
+    where
+        T: Component + Interpolate + Clone + Debug,
+    {
+        self.add_systems(
+            PreUpdate,
+            (
+                snapshot_buffer_init_system::<T>,
+                snapshot_interpolation_system::<T>,
+            )
+                .after(ClientSet::Receive)
+                .run_if(resource_exists::<RenetClient>()),
+        );
+        self.replicate_with::<T>(serialize, deserialize, remove)
+    }
+}
